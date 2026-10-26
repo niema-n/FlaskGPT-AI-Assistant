@@ -3,11 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "vendor:markdown": "node scripts/vendor-markdown.cjs",
     "build:css": "tailwindcss -i ./static/css/input.css -o ./static/dist/css/style.css",
     "watch:css": "tailwindcss -i ./static/css/input.css -o ./static/dist/css/style.css --watch"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.3",
+    "marked": "18.1.2",
     "tailwindcss": "^4.3.3"
   }
 }

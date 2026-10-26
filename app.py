@@ -4,6 +4,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from io import BytesIO
 import json
+import ast
 import re
 
 # Permet de lire les variables d’environnement.
@@ -36,6 +37,11 @@ from groq import (
 from dotenv import load_dotenv
 
 load_dotenv()
+
+try:
+    MAX_COMPLETION_TOKENS = max(256, min(32768, int(os.getenv("GROQ_MAX_COMPLETION_TOKENS", "8192"))))
+except ValueError:
+    MAX_COMPLETION_TOKENS = 8192
 
 # Initialise le SDK officiel Groq à partir de la clé stockée côté serveur.
 groq_api_key = os.getenv("GROQ_API_KEY")
@@ -113,6 +119,40 @@ DOMAIN_INSTRUCTIONS = {
         "la langue de l'utilisateur."
     ),
 }
+
+
+MARKDOWN_INSTRUCTIONS = """
+Format de la réponse : utilise du Markdown GitHub Flavored Markdown (GFM) valide.
+Structure les explications avec des titres hiérarchisés, des paragraphes et des listes lisibles.
+Pour chaque bloc de code, indique un langage explicite après la clôture ouvrante
+(par exemple ```python), puis ferme correctement le bloc avec une clôture seule sur sa ligne.
+Ne place jamais de bloc de code multiligne dans une cellule de tableau Markdown.
+Place ces exemples en dehors du tableau, sous un titre ou un paragraphe qui les identifie.
+Dans les tableaux, conserve une ligne par rangée, le même nombre de colonnes et une ligne
+de séparation valide ; utilise seulement du code inline court dans les cellules,
+échappe les barres verticales littérales avec un antislash et évite les tableaux trop larges.
+N'écris jamais les mentions « Copier le code », « Copier la réponse » ou des boutons
+d'interface dans le contenu généré : l'application fournit ces commandes séparément.
+Ces règles de présentation ne doivent pas réduire la pertinence, l'exactitude ou le
+niveau de détail demandé, ni modifier les consignes de spécialisation du domaine.
+""".strip()
+
+TECHNICAL_QUALITY_INSTRUCTIONS = """
+Qualité technique : fournis du code Python syntaxiquement valide avec imports et
+préconditions explicites. Distingue clairement les colonnes réellement connues via
+les données de l'utilisateur des noms fictifs choisis pour un exemple. Si le schéma
+est inconnu, demande-le ou annonce explicitement un jeu de données synthétique.
+Explique les hypothèses et vérifie la cohérence des noms et des types utilisés.
+Respecte les API des bibliothèques citées ; si leur comportement ou leur version
+est incertain, signale-le au lieu d'inventer des méthodes ou paramètres.
+Ne présente pas des statistiques, une distribution, une performance ou un résultat
+comme mesurés sans calcul et données correspondants. Ne prétends pas avoir exécuté
+un code lorsque ce n'est pas le cas. Pour le Machine Learning, sépare entraînement
+et test avant d'ajuster imputations, normalisation, sélection de variables ou
+rééchantillonnage. Ajuste ces transformations uniquement sur l'entraînement et à
+l'intérieur des plis de validation croisée, idéalement dans un pipeline adapté.
+Ne garantis pas l'exactitude ou l'absence de fuite sur la seule base d'un exemple.
+""".strip()
 
 
 def normalize_domain(domain: object) -> str:
@@ -284,6 +324,8 @@ def init_db() -> None:
             connection.execute(
                 "ALTER TABLE messages ADD COLUMN source_references TEXT NOT NULL DEFAULT '[]'"
             )
+        if "generation_info" not in message_columns:
+            connection.execute("ALTER TABLE messages ADD COLUMN generation_info TEXT NOT NULL DEFAULT '{}'")
 
 
 def current_timestamp() -> str:
@@ -430,18 +472,21 @@ def save_request_metric(conversation_id: str, performance: dict) -> None:
 def save_assistant_message(
     conversation_id: str, content: str, performance: dict | None = None,
     source_references: list[dict] | None = None,
-) -> None:
+    generation_info: dict | None = None,
+) -> int:
     timestamp = current_timestamp()
     with database_connection() as connection:
-        connection.execute(
+        cursor = connection.execute(
             """
             INSERT INTO messages (
-                conversation_id, role, content, created_at, source_references
-            ) VALUES (?, 'assistant', ?, ?, ?)
+                conversation_id, role, content, created_at, source_references, generation_info
+            ) VALUES (?, 'assistant', ?, ?, ?, ?)
             """,
             (conversation_id, content, timestamp,
-             json.dumps(source_references or [], ensure_ascii=False)),
+             json.dumps(source_references or [], ensure_ascii=False),
+             json.dumps(generation_info or {}, ensure_ascii=False)),
         )
+        message_id = cursor.lastrowid
         connection.execute(
             "UPDATE conversations SET updated_at = ? WHERE id = ?",
             (timestamp, conversation_id),
@@ -472,6 +517,9 @@ def save_assistant_message(
                     performance["status"], timestamp,
                 ),
             )
+
+
+    return message_id
 
 
 _database_init_lock = Lock()
@@ -766,7 +814,7 @@ def get_conversation(conversation_id: str):
 
         messages = connection.execute(
             """
-            SELECT m.id, m.role, m.content, m.created_at, r.rating, m.source_references
+            SELECT m.id, m.role, m.content, m.created_at, r.rating, m.source_references, m.generation_info
             FROM messages m
             LEFT JOIN response_ratings r ON r.message_id = m.id
             WHERE m.conversation_id = ?
@@ -778,6 +826,10 @@ def get_conversation(conversation_id: str):
     message_data = [dict(message) for message in messages]
     for message in message_data:
         try:
+            message["generation"] = json.loads(message.pop("generation_info") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            message["generation"] = {}
+        try:
             message["source_references"] = json.loads(message["source_references"] or "[]")
         except (TypeError, json.JSONDecodeError):
             message["source_references"] = []
@@ -786,6 +838,52 @@ def get_conversation(conversation_id: str):
         **dict(conversation),
         messages=message_data,
     )
+
+
+@app.post('/api/conversations/<conversation_id>/edit')
+def edit_user_message(conversation_id: str):
+    """Fork at an edited user turn; keep the original conversation intact."""
+    if not request.is_json:
+        return jsonify(error="Le format JSON est requis."), 415
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="Le JSON doit être un objet valide."), 400
+    index, content = data.get("message_index"), data.get("content")
+    if type(index) is not int or index < 0:
+        return jsonify(error="Choisissez un message utilisateur valide."), 400
+    if not isinstance(content, str) or not content.strip() or len(content) > 4000:
+        return jsonify(error="Le message doit contenir entre 1 et 4 000 caractères."), 400
+    with database_connection() as connection:
+        original = connection.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        if original is None:
+            return jsonify(error="Conversation introuvable."), 404
+        messages = connection.execute(
+            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY id", (conversation_id,)
+        ).fetchall()
+        if index >= len(messages) or messages[index]["role"] != "user":
+            return jsonify(error="Seuls vos messages peuvent être modifiés."), 400
+        if data.get("original_content") != messages[index]["content"]:
+            return jsonify(error="Ce message a changé. Rouvrez la conversation avant de le modifier."), 409
+        branch_id, timestamp = str(uuid4()), current_timestamp()
+        connection.execute(
+            "INSERT INTO conversations (id, title, domain, custom_domain, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (branch_id, ("Modifié · " + content.strip())[:80], original["domain"], original["custom_domain"], timestamp, timestamp),
+        )
+        for position, message in enumerate(messages[:index + 1]):
+            edited = position == index
+            cursor = connection.execute(
+                "INSERT INTO messages (conversation_id, role, content, created_at, source_references, generation_info) VALUES (?, ?, ?, ?, ?, ?)",
+                (branch_id, message["role"], content.strip() if edited else message["content"],
+                 timestamp if edited else message["created_at"], "[]" if edited else message["source_references"],
+                 "{}" if edited else message["generation_info"]),
+            )
+            if not edited:
+                connection.execute(
+                    """INSERT INTO response_ratings (message_id, conversation_id, rating, created_at, updated_at)
+                       SELECT ?, ?, rating, created_at, updated_at FROM response_ratings WHERE message_id = ?""",
+                    (cursor.lastrowid, branch_id, message["id"]),
+                )
+    return get_conversation(branch_id), 201
 
 
 @app.post('/api/messages/<int:message_id>/rating')
@@ -1675,7 +1773,7 @@ def prompt():
             "réponds dans la langue de l’utilisateur, distingue les faits des hypothèses "
             "et signale les limites ou incertitudes pertinentes. Le nom du domaine est "
             "uniquement un contexte thématique ; respecte les règles de sécurité habituelles."
-        )},
+        ) + "\n\n" + MARKDOWN_INSTRUCTIONS + "\n\n" + TECHNICAL_QUALITY_INSTRUCTIONS},
         *([{
             "role": "system",
             "content": (
@@ -1728,6 +1826,7 @@ def prompt():
             model="openai/gpt-oss-20b",
             messages=conversation,
             stream=True,
+            max_completion_tokens=MAX_COMPLETION_TOKENS,
         )
     except APIError as error:
         record_provider_error(error)
@@ -1737,17 +1836,43 @@ def prompt():
         app.logger.error("Groq request setup error (%s)", type(error).__name__)
         return jsonify(error="La demande n’a pas pu être envoyée au service Groq."), 502
 
-    # Renvoie progressivement la réponse sous forme de texte brut.
+    structured = "text/event-stream" in request.headers.get("Accept", "")
     return Response(
         event_stream(
             response_stream, conversation_id, request_started, source_references,
-            domain, custom_domain,
+            domain, custom_domain, structured=structured,
         ),
-        content_type="text/plain; charset=utf-8"
+        content_type="text/event-stream; charset=utf-8" if structured else "text/plain; charset=utf-8",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-# Génère progressivement les fragments de texte de la réponse.
+def generation_state(finish_reason: str | None, has_text: bool, error_type: str | None = None) -> dict:
+    if error_type:
+        status, reason = ("partial" if has_text else "error"), "interrupted"
+        message = "La génération a été interrompue."
+    elif not has_text:
+        status, reason, message = "error", "empty", "Le modèle n’a renvoyé aucun texte."
+    elif finish_reason == "stop":
+        status, reason, message = "complete", "stop", "Fin de génération confirmée par le modèle."
+    elif finish_reason == "length":
+        status, reason, message = "partial", "token_limit", "Réponse incomplète : limite de tokens atteinte."
+    elif finish_reason == "content_filter":
+        status, reason, message = "partial", "content_filter", "Réponse interrompue par le filtre du fournisseur."
+    elif finish_reason in {"tool_calls", "function_call"}:
+        status, reason, message = "partial", "tool_call", "Réponse incomplète : le modèle a demandé un outil non exécuté."
+    else:
+        status, reason, message = "partial", "missing_finish", "Fin de génération non confirmée : le flux s’est fermé sans signal de fin."
+    return {"status": status, "reason": reason, "finish_reason": finish_reason,
+            "message": message, "can_continue": has_text and status == "partial" and reason != "content_filter",
+            "max_completion_tokens": MAX_COMPLETION_TOKENS}
+
+
+def stream_event(event_type: str, **payload) -> str:
+    return "data: " + json.dumps({"type": event_type, **payload}, ensure_ascii=False) + "\n\n"
+
+
+# Keep provider text byte-for-byte separate from transport/status metadata.
 def event_stream(
     response: Iterator,
     conversation_id: str | None = None,
@@ -1755,17 +1880,19 @@ def event_stream(
     source_references: list[dict] | None = None,
     domain: str = "Général",
     custom_domain: str = "",
+    structured: bool = False,
 ) -> Iterator[str]:
     response_parts = []
     generated_text = False
     usage_values = None
-    request_status = "complete"
+    finish_reason = None
+    message_id = None
     stream_error_type = None
     stream_error_code = None
     try:
         # Parcourt les fragments reçus depuis l’API.
         for chunk in response:
-            usage = getattr(chunk, "usage", None)
+            usage = getattr(chunk, "usage", None) or getattr(getattr(chunk, "x_groq", None), "usage", None)
             if usage is not None:
                 prompt_tokens = getattr(usage, "prompt_tokens", None)
                 completion_tokens = getattr(usage, "completion_tokens", None)
@@ -1792,59 +1919,74 @@ def event_stream(
 
             # Récupère le texte du fragment, ou une chaîne vide.
             # Dans le SDK récent, delta est un objet : on utilise .content.
-            text = chunk.choices[0].delta.content or ""
+            choice = chunk.choices[0]
+            if getattr(choice, "finish_reason", None) is not None:
+                finish_reason = choice.finish_reason
+            text = getattr(getattr(choice, "delta", None), "content", None) or ""
 
             # Transmet et mémorise chaque fragment sans interrompre le flux.
             if text:
                 generated_text = True
                 response_parts.append(text)
-                yield text
+                yield stream_event("delta", text=text) if structured else text
     except APIError as error:
-        request_status = "partial" if generated_text else "error"
-        message, _ = groq_error_details(error)
         app.logger.error("Groq stream error (%s)", type(error).__name__)
-        error_text = f"\n\n> **Erreur de connexion à l’assistant :** {message}"
         stream_error_type = type(error).__name__
         stream_error_code = getattr(error, "status_code", None)
-        response_parts.append(error_text)
-        yield error_text
     except GeneratorExit:
-        request_status = "partial"
         stream_error_type = "GeneratorExit"
         raise
     except Exception as error:
-        request_status = "partial" if generated_text else "error"
         app.logger.error("Groq stream processing error (%s)", type(error).__name__)
         stream_error_type = type(error).__name__
         stream_error_code = getattr(error, "status_code", None)
-        error_text = (
-            "\n\n> **La génération a été interrompue.** "
-            "Consultez l’historique avant de relancer la question."
-        )
-        response_parts.append(error_text)
-        yield error_text
     finally:
+        generation = generation_state(finish_reason, generated_text, stream_error_type)
         if conversation_id:
-            if request_status == "complete" and not generated_text:
-                request_status = "error"
             performance = {
                 "response_time_ms": round(
                     (perf_counter() - request_started) * 1000, 1
                 ) if request_started is not None else 0.0,
-                "status": request_status,
+                "status": generation["status"],
                 "domain": domain,
                 "custom_domain": custom_domain,
-                "error_type": stream_error_type,
+                "error_type": stream_error_type or (generation["reason"] if generation["status"] != "complete" else None),
                 "error_code": stream_error_code,
                 **(usage_values or {}),
             }
             if response_parts:
-                save_assistant_message(
+                message_id = save_assistant_message(
                     conversation_id, "".join(response_parts), performance,
-                    source_references,
+                    source_references, generation_info=generation,
                 )
             else:
                 save_request_metric(conversation_id, performance)
+        close_stream = getattr(response, "close", None)
+        if close_stream:
+            close_stream()
+    if structured:
+        yield stream_event("done", generation=generation, message_id=message_id)
+
+
+@app.post('/api/code/validate-python')
+def validate_python_code():
+    """Parse only: never execute, import or evaluate model-provided Python."""
+    if not request.is_json:
+        return jsonify(error="Le format JSON est requis."), 415
+    data = request.get_json(silent=True)
+    code = data.get("code") if isinstance(data, dict) else None
+    if not isinstance(code, str) or len(code) > 100_000:
+        return jsonify(error="Le bloc doit contenir au maximum 100 000 caractères."), 400
+    try:
+        ast.parse(code, mode="exec")
+    except SyntaxError as error:
+        return jsonify(status="invalid", line=error.lineno, column=error.offset, message=error.msg,
+                       scope="syntax_only", executed=False)
+    except (ValueError, RecursionError, MemoryError):
+        return jsonify(status="unchecked", message="Bloc trop complexe pour cette vérification.",
+                       scope="syntax_only", executed=False)
+    return jsonify(status="valid", scope="syntax_only", executed=False,
+                   message="Syntaxe Python valide. Le code n’a pas été exécuté ; les données et résultats ne sont pas vérifiés.")
 
 # Transforme les messages en une liste de dictionnaires contenant le rôle et le contenu.
 # Les annotations indiquent une liste en entrée et une liste de dictionnaires en sortie.

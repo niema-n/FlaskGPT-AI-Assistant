@@ -1,3 +1,162 @@
+// The conversation has one scroll owner. Reading older messages pauses following.
+let followConversation = true;
+const messageText = new WeakMap();
+const messageGeneration = new WeakMap();
+const pythonChecks = new Map();
+const markdownBlocks = new WeakMap();
+const markdownParser = new marked.Marked({ gfm: true, breaks: false, async: false });
+
+function isNearConversationEnd() {
+    const viewport = document.querySelector("#conversation-scroll");
+    return viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 96;
+}
+
+function syncConversationScroll(force = false) {
+    const viewport = document.querySelector("#conversation-scroll");
+    if (force) followConversation = true;
+    if (followConversation) viewport.scrollTop = viewport.scrollHeight;
+    document.querySelector("#jump-to-latest").hidden = isNearConversationEnd();
+}
+
+// Reconcile only DOM trees produced by DOMPurify or created by the UI below.
+// Keep existing nodes where possible: focus, selections in completed blocks,
+// and horizontal scroll positions must survive incoming chunks.
+function reconcileMarkdownNode(current, next) {
+    if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
+        current.replaceWith(next);
+        return next;
+    }
+    if (current.nodeType === Node.TEXT_NODE || current.nodeType === Node.COMMENT_NODE) {
+        if (current.data !== next.data) current.data = next.data;
+        return current;
+    }
+    for (const attribute of [...current.attributes]) {
+        if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+    }
+    for (const attribute of next.attributes) {
+        if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
+    }
+    const incoming = [...next.childNodes];
+    incoming.forEach((child, index) => {
+        if (current.childNodes[index]) reconcileMarkdownNode(current.childNodes[index], child);
+        else current.append(child);
+    });
+    while (current.childNodes.length > incoming.length) current.lastChild.remove();
+    return current;
+}
+
+function decorateMarkdownBlock(node) {
+    const container = document.createElement("div");
+    container.append(node);
+    container.querySelectorAll("pre").forEach((pre) => {
+        const code = pre.querySelector("code");
+        if (!code) return;
+        const languageId = [...code.classList].find((name) => name.startsWith("language-"))?.slice(9) || "";
+        const names = { python: "Python", py: "Python", javascript: "JavaScript", js: "JavaScript", json: "JSON", html: "HTML", css: "CSS", sql: "SQL", bash: "Bash" };
+        const language = names[languageId.toLowerCase()] || (/^[a-z0-9_+-]+$/i.test(languageId) ? languageId : "Code");
+        const wrapper = document.createElement("div");
+        wrapper.className = "code-block";
+        const toolbar = document.createElement("div");
+        toolbar.className = "code-toolbar";
+        const label = document.createElement("span");
+        label.className = "code-language";
+        label.textContent = language;
+        const copy = document.createElement("button");
+        copy.type = "button";
+        copy.className = "toolbar-button copy-code-button";
+        copy.textContent = "Copier";
+        copy.setAttribute("aria-label", `Copier le bloc ${language}`);
+        toolbar.append(label, document.createTextNode(" "), copy);
+        pre.before(wrapper);
+        wrapper.append(toolbar, pre);
+        pre.tabIndex = 0;
+        pre.setAttribute("aria-label", `Code ${language}, défilement horizontal disponible`);
+    });
+    container.querySelectorAll("table").forEach((table) => {
+        const wrapper = document.createElement("div");
+        wrapper.className = "table-scroll";
+        wrapper.tabIndex = 0;
+        wrapper.setAttribute("role", "region");
+        wrapper.setAttribute("aria-label", "Tableau, défilement horizontal disponible");
+        table.before(wrapper);
+        wrapper.append(table);
+    });
+    return container.firstChild;
+}
+
+function renderMarkdown(element, text, final = true) {
+    messageText.set(element, text);
+    // Parse the complete accumulated source, including unfinished fences. Never
+    // insert UI labels into Markdown or try to repair malformed tables with regex.
+    const fragment = DOMPurify.sanitize(markdownParser.parse(text), {
+        RETURN_DOM_FRAGMENT: true,
+        USE_PROFILES: { html: true },
+        FORBID_TAGS: ["style", "form", "input", "button", "textarea", "select"],
+        FORBID_ATTR: ["style", "id", "name"],
+    });
+    const previous = markdownBlocks.get(element) || [];
+    const nodes = [...fragment.childNodes].filter(node => node.nodeType !== Node.TEXT_NODE || node.textContent.trim());
+    const blocks = nodes.map((sourceNode, index) => {
+        const signature = sourceNode.outerHTML || sourceNode.textContent;
+        const old = previous[index];
+        let node;
+        if (old?.signature === signature) node = old.node;
+        else {
+            const next = decorateMarkdownBlock(sourceNode);
+            node = old?.node.parentNode === element ? reconcileMarkdownNode(old.node, next) : next;
+        }
+        if (element.childNodes[index] !== node) element.insertBefore(node, element.childNodes[index] || null);
+        return { signature, node };
+    });
+    while (element.childNodes.length > blocks.length) element.lastChild.remove();
+    markdownBlocks.set(element, blocks);
+    if (final && window.hljs) {
+        element.querySelectorAll("pre code:not([data-highlighted])").forEach((code) => {
+            const language = [...code.classList].find(name => name.startsWith("language-"))?.slice(9);
+            if (language && window.hljs.getLanguage(language)) window.hljs.highlightElement(code);
+        });
+    }
+    if (final) validatePythonBlocks(element);
+}
+
+function validatePythonBlocks(element) {
+    element.querySelectorAll('pre code.language-python, pre code.language-py').forEach(code => {
+        const wrapper = code.closest('.code-block');
+        if (wrapper.querySelector('.code-validation')) return;
+        const status = document.createElement('p');
+        status.className = 'code-validation';
+        status.setAttribute('role', 'status');
+        status.textContent = 'Vérification de la syntaxe Python…';
+        wrapper.append(status);
+        const source = code.textContent;
+        if (source.length > 100000) {
+            status.textContent = 'Vérification non effectuée : bloc trop volumineux. Code non exécuté.';
+            return;
+        }
+        if (!pythonChecks.has(source)) {
+            if (pythonChecks.size >= 128) pythonChecks.delete(pythonChecks.keys().next().value);
+            pythonChecks.set(source, fetch('/api/code/validate-python', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: source }),
+            }).then(response => {
+                if (!response.ok) throw new Error('Vérification indisponible');
+                return response.json();
+            }).catch(() => {
+                pythonChecks.delete(source);
+                return { status: 'unchecked', message: 'Vérification indisponible. Code non exécuté.' };
+            }));
+        }
+        pythonChecks.get(source).then(result => {
+            if (!status.isConnected || code.textContent !== source) return;
+            status.dataset.status = result.status;
+            status.textContent = result.status === 'valid'
+                ? 'Syntaxe Python valide · code non exécuté, résultats non vérifiés.'
+                : result.status === 'invalid'
+                    ? `Syntaxe à corriger${result.line ? `, ligne ${result.line}` : ''} : ${result.message}. Code non exécuté.`
+                    : result.message;
+        });
+    });
+}
+
 // Crée un nouveau bloc de message à partir du modèle HTML caché.
 function createMessageElement() {
     // Récupère le conteneur qui affiche les messages de la conversation.
@@ -14,7 +173,7 @@ function createMessageElement() {
 
     // Ajoute le nouveau bloc à la fin de la conversation.
     output.appendChild(clone);
-    output.scrollTop = output.scrollHeight;
+    document.querySelector("#conversation-welcome").hidden = true;
 
     // Retire la classe Tailwind "hidden" pour rendre le bloc visible.
     clone.classList.remove("hidden");
@@ -39,21 +198,19 @@ function appendMessage(message, role = "user") {
     }
 
     if (role === "assistant") {
-        const converter = new showdown.Converter({
-            tables: true,
-            ghCodeBlocks: true,
-            simplifiedAutoLink: true,
-        });
-        infoBlock.innerHTML = DOMPurify.sanitize(converter.makeHtml(message));
+        renderMarkdown(infoBlock, message);
     } else {
         // Insère le message utilisateur comme du texte, sans HTML.
-        infoBlock.innerText = message;
+        infoBlock.textContent = message;
+        messageText.set(infoBlock, message);
     }
 
     infoBlock.parentElement.classList.add(
         role === "assistant" ? "chat-message-assistant" : "chat-message-user"
     );
     infoBlock.parentElement.dataset.roleLabel = role === "assistant" ? "FlaskGPT" : "Vous";
+    infoBlock.parentElement.setAttribute("aria-label", role === "assistant" ? "Réponse de FlaskGPT" : "Votre message");
+    syncConversationScroll();
 
     // Retourne l’élément pour pouvoir modifier son contenu ensuite.
     return infoBlock;
@@ -77,6 +234,7 @@ async function fetchPromptResponse(conversationId, sourceIds, passagesPerSource,
         // Indique que le corps de la requête contient du JSON.
         headers: {
             "Content-Type": "application/json",
+            "Accept": "text/event-stream",
         },
 
         // Récupère l’historique et le convertit en texte JSON.
@@ -102,7 +260,9 @@ async function fetchPromptResponse(conversationId, sourceIds, passagesPerSource,
     }
 
     // Retourne un lecteur permettant de lire la réponse fragment par fragment.
-    return response.body.getReader();
+    const reader = response.body.getReader();
+    reader.structured = response.headers.get('Content-Type')?.includes('text/event-stream');
+    return reader;
 }
 
 // Lit la réponse progressive et affiche le texte converti en HTML.
@@ -110,16 +270,34 @@ async function readResponseChunks(reader, gptOutput) {
     // Décode les octets reçus en texte UTF-8.
     const decoder = new TextDecoder("utf-8");
 
-    // Crée le convertisseur Markdown vers HTML.
-    const converter = new showdown.Converter({
-        tables: true,
-        ghCodeBlocks: true,
-        simplifiedAutoLink: true,
-    });
-
     // Conserve le texte complet reçu jusqu’à présent.
     let text = "";
-    const scrollContainer = gptOutput.closest("#gpt-output");
+    let eventBuffer = "";
+    let receivedDone = false;
+    const consume = (chunk) => {
+        if (!reader.structured) { text += chunk; return; }
+        eventBuffer += chunk;
+        let boundary;
+        while ((boundary = eventBuffer.indexOf('\n\n')) !== -1) {
+            const frame = eventBuffer.slice(0, boundary);
+            eventBuffer = eventBuffer.slice(boundary + 2);
+            const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+            if (!data) continue;
+            const event = JSON.parse(data);
+            if (receivedDone) throw new Error('Données reçues après la fin du flux.');
+            if (event.type === 'delta') text += event.text;
+            if (event.type === 'done') {
+                receivedDone = true;
+                messageGeneration.set(gptOutput, event.generation);
+            }
+        }
+    };
+    let renderTimer = null;
+    const paint = (final = false) => {
+        renderMarkdown(gptOutput, text, final);
+        syncConversationScroll();
+    };
+    gptOutput.setAttribute("aria-busy", "true");
 
     try {
         while (true) {
@@ -132,41 +310,29 @@ async function readResponseChunks(reader, gptOutput) {
 
             // Décode le fragment en conservant les caractères incomplets
             // pour les compléter lors de la réception suivante.
-            text += decoder.decode(value, { stream: true });
+            consume(decoder.decode(value, { stream: true }));
 
-            // Convertit le Markdown en HTML et sécurise le résultat.
-            gptOutput.innerHTML = DOMPurify.sanitize(
-                converter.makeHtml(text)
-            );
-            if (scrollContainer) scrollContainer.scrollTop = scrollContainer.scrollHeight;
+            // Batch fast tokens to keep Markdown layout stable and avoid excess work.
+            if (renderTimer === null) renderTimer = window.setTimeout(() => {
+                renderTimer = null;
+                paint();
+            }, 80);
         }
 
         // Termine le décodage des éventuels octets restants.
-        text += decoder.decode();
-
-        if (
-            text.includes("\n\n> **Erreur de connexion") ||
-            text.includes("\n\n> **La g\u00e9n\u00e9ration a \u00e9t\u00e9 interrompue")
-        ) {
-            throw new Error("Le flux Groq s'est interrompu avant la fin de la réponse.");
-        }
+        consume(decoder.decode());
+        if (reader.structured && (!receivedDone || eventBuffer.trim())) throw new Error('Fin de transmission non confirmée.');
         if (!text.trim()) {
             throw new Error("Groq a renvoyé une réponse vide. Réessayez.");
         }
 
-        // Affiche le résultat final.
-        gptOutput.innerHTML = DOMPurify.sanitize(
-            converter.makeHtml(text)
-        );
-        if (scrollContainer) scrollContainer.scrollTop = scrollContainer.scrollHeight;
-        if (window.hljs) {
-            gptOutput.querySelectorAll("pre code").forEach((codeBlock) => {
-                window.hljs.highlightElement(codeBlock);
-            });
-        }
+    } catch (error) {
+        messageGeneration.set(gptOutput, { status: 'partial', reason: 'transport', can_continue: Boolean(text), message: 'Transmission interrompue : réponse possiblement incomplète.' });
+        throw error;
     } finally {
-        // Libère le lecteur, même si une erreur survient.
+        window.clearTimeout(renderTimer);
         reader.releaseLock();
+        try { paint(true); } finally { gptOutput.removeAttribute("aria-busy"); }
     }
 
     return text;
@@ -187,6 +353,27 @@ document.addEventListener("DOMContentLoaded", () => {
     const cancelNewChatButton = document.querySelector("#cancel-new-chat");
     const confirmNewChatButton = document.querySelector("#confirm-new-chat");
     const gptOutput = document.querySelector("#gpt-output");
+    const conversationScroll = document.querySelector("#conversation-scroll");
+    const jumpToLatest = document.querySelector("#jump-to-latest");
+    conversationScroll.addEventListener("scroll", () => {
+        followConversation = isNearConversationEnd();
+        jumpToLatest.hidden = followConversation;
+    }, { passive: true });
+    jumpToLatest.addEventListener("click", () => syncConversationScroll(true));
+    new ResizeObserver(() => syncConversationScroll()).observe(gptOutput);
+    new ResizeObserver(() => syncConversationScroll()).observe(form);
+    gptOutput.addEventListener("click", async (event) => {
+        const copy = event.target.closest(".copy-code-button");
+        if (!copy) return;
+        try {
+            await navigator.clipboard.writeText(copy.closest(".code-block").querySelector("code").textContent);
+            copy.textContent = "Copié";
+        } catch {
+            copy.textContent = "Copie impossible";
+            showChatError("Copie impossible. Sélectionnez le code ou autorisez le presse-papiers dans le navigateur.");
+        }
+        window.setTimeout(() => { copy.textContent = "Copier"; }, 1800);
+    });
     const domainSelect = document.querySelector("#domain");
     const domainHint = document.querySelector("#domain-hint");
     const customDomainField = document.querySelector("#custom-domain-field");
@@ -200,6 +387,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const exportConversationButton = document.querySelector("#export-conversation-button");
     const exportConversationLabel = document.querySelector("#export-conversation-label");
     const exportFormat = document.querySelector("#export-format");
+    const exportStatus = document.querySelector("#export-status");
     const exportPdfButton = document.querySelector("#export-pdf-button");
     const exportPdfLabel = document.querySelector("#export-pdf-label");
     const dataQualityForm = document.querySelector("#data-quality-form");
@@ -276,7 +464,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const selectedSourceIds = new Set();
     let activeConversationId = null;
     let requestInProgress = false;
+    let activeMessageEdit = null;
     let exportInProgress = false;
+    let exportStatusConversationId = null;
+    let exportFeedback = "";
 
     const viewLabels = {
         dashboard: ["Tableau de bord", "Vue synthetique de votre activite FlaskGPT."],
@@ -290,6 +481,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function setActiveView(viewName) {
         const selectedView = viewLabels[viewName] ? viewName : "dashboard";
+        document.body.classList.toggle("assistant-view", selectedView === "assistant");
+        document.querySelector("#conversation-actions").open = false;
         const [title, description] = viewLabels[selectedView];
         viewPanels.forEach((panel) => {
             panel.classList.toggle("hidden", panel.dataset.viewPanel !== selectedView);
@@ -310,6 +503,10 @@ document.addEventListener("DOMContentLoaded", () => {
         pageHeading.textContent = title;
         pageDescription.textContent = description;
         window.scrollTo({ top: 0, behavior: "auto" });
+        if (selectedView === "assistant") requestAnimationFrame(() => {
+            syncPromptComposer();
+            syncConversationScroll();
+        });
         return selectedView;
     }
 
@@ -376,13 +573,26 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     function updateExportButton() {
-        const unavailable = requestInProgress || exportInProgress ||
-            !activeConversationId || conversationHistory.length === 0;
+        syncUserMessageActions();
+        document.querySelector("#conversation-welcome").hidden = conversationHistory.length > 0;
+        if (exportStatusConversationId !== activeConversationId) {
+            exportStatusConversationId = activeConversationId;
+            exportFeedback = "";
+        }
+        const hasMessages = activeConversationId && conversationHistory.length > 0;
+        const unavailable = requestInProgress || exportInProgress || Boolean(activeMessageEdit) ||
+            !hasMessages;
         exportPdfButton.disabled = unavailable;
-        exportConversationButton.disabled = unavailable;
+        exportConversationButton.disabled = unavailable || !exportFormat.value;
         exportFormat.disabled = unavailable;
         exportPdfLabel.textContent = exportInProgress ? "Préparation…" : "Résumé PDF";
-        exportConversationLabel.textContent = exportInProgress ? "Préparation…" : "Exporter";
+        exportConversationLabel.textContent = exportInProgress ? "Préparation…"
+            : `Télécharger${exportFormat.value ? ` ${exportFormat.value.toUpperCase()}` : ""}`;
+        exportStatus.textContent = !hasMessages
+            ? "Ouvrez une conversation de l’historique ou envoyez un message pour l’exporter."
+            : exportInProgress ? "Préparation du fichier…"
+            : requestInProgress ? "L’export sera disponible à la fin de la réponse."
+            : exportFeedback || "Choisissez TXT, PDF complet ou JSON pour télécharger tous les messages.";
     }
 
     function renderQualityReport(report) {
@@ -1007,23 +1217,14 @@ document.addEventListener("DOMContentLoaded", () => {
         {
             value: "satisfaisante",
             label: "Satisfaisante",
-            button: "border-emerald-200 bg-white text-emerald-700 hover:bg-emerald-50",
-            selected: ["border-emerald-500", "bg-emerald-100", "text-emerald-900", "ring-1", "ring-emerald-300"],
-            card: ["border-l-4", "border-l-emerald-500", "ring-1", "ring-emerald-100"],
         },
         {
             value: "moyenne",
             label: "Moyenne",
-            button: "border-amber-200 bg-white text-amber-700 hover:bg-amber-50",
-            selected: ["border-amber-500", "bg-amber-100", "text-amber-900", "ring-1", "ring-amber-300"],
-            card: ["border-l-4", "border-l-amber-500", "ring-1", "ring-amber-100"],
         },
         {
             value: "insuffisante",
             label: "Insuffisante",
-            button: "border-rose-200 bg-white text-rose-700 hover:bg-rose-50",
-            selected: ["border-rose-500", "bg-rose-100", "text-rose-900", "ring-1", "ring-rose-300"],
-            card: ["border-l-4", "border-l-rose-500", "ring-1", "ring-rose-100"],
         },
     ];
 
@@ -1041,15 +1242,28 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function getMessageActions(messageElement) {
+        const card = messageElement.parentElement;
+        let actions = card.querySelector(".message-actions");
+        if (!actions) {
+            actions = document.createElement("div");
+            actions.className = "message-actions";
+            actions.setAttribute("role", "group");
+            actions.setAttribute("aria-label", "Actions de la réponse");
+            card.append(actions);
+        }
+        return actions;
+    }
+
     function renderResponseRating(messageElement, messageId, currentRating = null) {
         if (!messageId || messageElement.parentElement.querySelector(".response-rating")) return;
         const ratingContainer = document.createElement("div");
-        ratingContainer.className = "response-rating mt-4 flex flex-wrap items-center gap-2 border-t border-slate-200/80 pt-3";
+        ratingContainer.className = "response-rating";
         ratingContainer.setAttribute("role", "group");
         ratingContainer.setAttribute("aria-label", "Évaluer cette réponse");
 
         const prompt = document.createElement("span");
-        prompt.className = "mr-1 text-xs font-medium text-slate-500";
+        prompt.className = "sr-only";
         prompt.textContent = "Votre évaluation :";
         ratingContainer.appendChild(prompt);
 
@@ -1057,13 +1271,9 @@ document.addEventListener("DOMContentLoaded", () => {
             const button = document.createElement("button");
             button.type = "button";
             button.dataset.rating = option.value;
-            button.className = [
-                "rounded-lg border px-3 py-1.5 text-xs font-semibold transition",
-                "focus:outline-none focus:ring-2 focus:ring-offset-1",
-                "disabled:cursor-wait disabled:opacity-60",
-                option.button,
-            ].join(" ");
+            button.className = "toolbar-button rating-button";
             button.textContent = option.label;
+            button.setAttribute("aria-label", `Évaluer la réponse : ${option.label.toLowerCase()}`);
             button.setAttribute("aria-pressed", String(currentRating === option.value));
             button.addEventListener("click", () => saveResponseRating(
                 messageElement, Number(messageId), option.value, buttons
@@ -1071,24 +1281,13 @@ document.addEventListener("DOMContentLoaded", () => {
             ratingContainer.appendChild(button);
             return button;
         });
-        messageElement.parentElement.appendChild(ratingContainer);
+        getMessageActions(messageElement).appendChild(ratingContainer);
         updateResponseRatingVisual(messageElement, ratingContainer, currentRating);
     }
 
     function updateResponseRatingVisual(messageElement, ratingContainer, rating) {
-        const card = messageElement.parentElement;
-        const allCardClasses = [...new Set(
-            responseRatingOptions.flatMap((option) => option.card)
-        )];
-        card.classList.remove(...allCardClasses);
         ratingContainer.querySelectorAll("button[data-rating]").forEach((button) => {
-            const option = responseRatingOptions.find((item) => item.value === button.dataset.rating);
-            button.classList.remove(...option.selected);
             button.setAttribute("aria-pressed", String(button.dataset.rating === rating));
-            if (button.dataset.rating === rating) {
-                button.classList.add(...option.selected);
-                card.classList.add(...option.card);
-            }
         });
     }
 
@@ -1220,6 +1419,7 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     function renderSourceReferences(messageElement, references, messageId) {
+        if (!references.length) return;
         const container = document.createElement("section");
         container.className = "source-references mt-4 rounded-xl border border-indigo-100 bg-indigo-50/50 p-3";
         const heading = document.createElement("h4");
@@ -1290,19 +1490,54 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
+    function renderGenerationState(element, generation = {}, isLast = true) {
+        const state = generation.status ? generation : {
+            status: 'unknown', can_continue: true,
+            message: 'La fin de génération de cette ancienne réponse n’a pas été enregistrée.',
+        };
+        messageGeneration.set(element, state);
+        const card = element.parentElement;
+        card.querySelector('.response-generation-state')?.remove();
+        if (state.status === 'complete') return;
+        const panel = document.createElement('div');
+        panel.className = 'response-generation-state';
+        panel.dataset.status = state.status;
+        panel.setAttribute('role', 'status');
+        const message = document.createElement('p');
+        message.textContent = state.message || 'Réponse incomplète.';
+        panel.append(message);
+        if (isLast && state.can_continue) {
+            const resume = document.createElement('button');
+            resume.type = 'button';
+            resume.className = 'toolbar-button continue-response';
+            resume.textContent = 'Continuer la réponse';
+            resume.disabled = requestInProgress;
+            resume.addEventListener('click', () => {
+                if (requestInProgress || activeMessageEdit || card !== gptOutput.lastElementChild) return;
+                const draft = promptInput.value;
+                promptInput.value = 'Continue la réponse précédente en conservant son contexte. Ne répète pas les parties terminées. Si un bloc de code ou un tableau a été interrompu, redonne cet élément en entier, avec une syntaxe et des clôtures Markdown valides, puis poursuis. Précise les hypothèses de tes exemples.';
+                syncPromptComposer();
+                form.requestSubmit();
+                promptInput.value = draft;
+                syncPromptComposer();
+            });
+            panel.append(resume);
+        }
+        element.before(panel);
+    }
+
     function renderCopyAction(messageElement) {
         const card = messageElement.parentElement;
         if (card.querySelector(".copy-response-button")) return;
-        const toolbar = document.createElement("div");
-        toolbar.className = "mt-3 flex justify-end";
+        const toolbar = getMessageActions(messageElement);
         const copyButton = document.createElement("button");
         copyButton.type = "button";
-        copyButton.className = "copy-response-button inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500";
+        copyButton.className = "copy-response-button toolbar-button";
         copyButton.textContent = "Copier la r\u00e9ponse";
         copyButton.setAttribute("aria-label", "Copier le texte de cette réponse");
         copyButton.addEventListener("click", async () => {
             try {
-                await navigator.clipboard.writeText(messageElement.innerText);
+                await navigator.clipboard.writeText(messageText.get(messageElement) || messageElement.innerText);
                 copyButton.textContent = "Copi\u00e9";
                 window.setTimeout(() => { copyButton.textContent = "Copier la r\u00e9ponse"; }, 1600);
             } catch (error) {
@@ -1310,7 +1545,6 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         });
         toolbar.appendChild(copyButton);
-        card.appendChild(toolbar);
     }
 
     refreshPerformanceButton.addEventListener("click", refreshPerformanceDashboard);
@@ -1355,13 +1589,15 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function downloadFullConversation() {
         if (exportConversationButton.disabled) return;
+        const conversationId = activeConversationId;
+        const format = exportFormat.value;
         clearChatError();
+        exportFeedback = "";
         exportInProgress = true;
         updateExportButton();
         try {
-            const format = exportFormat.value;
             const response = await fetch(
-                `/api/conversations/${encodeURIComponent(activeConversationId)}/export/${format}`
+                `/api/conversations/${encodeURIComponent(conversationId)}/export/${format}`
             );
             if (!response.ok) {
                 const data = await response.json().catch(() => ({}));
@@ -1379,7 +1615,13 @@ document.addEventListener("DOMContentLoaded", () => {
             link.click();
             link.remove();
             window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+            if (activeConversationId === conversationId) {
+                exportFeedback = `Téléchargement ${format.toUpperCase()} lancé : ${link.download}`;
+            }
         } catch (error) {
+            if (activeConversationId === conversationId) {
+                exportFeedback = "L’export a échoué. Cliquez sur Télécharger pour réessayer.";
+            }
             showChatError(
                 error instanceof TypeError
                     ? "Impossible de joindre Flask. Vérifiez que le serveur fonctionne et réessayez."
@@ -1453,6 +1695,175 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function syncUserMessageActions() {
+        gptOutput.querySelectorAll(".edit-user-message").forEach(control => { control.disabled = requestInProgress; });
+        gptOutput.querySelectorAll('.continue-response').forEach(control => { control.disabled = requestInProgress || Boolean(activeMessageEdit); });
+        button.disabled = requestInProgress || Boolean(activeMessageEdit);
+        promptInput.disabled = Boolean(activeMessageEdit);
+        clearPromptButton.disabled = Boolean(activeMessageEdit);
+        domainSelect.disabled = requestInProgress || Boolean(activeMessageEdit);
+        customDomainInput.disabled = domainSelect.disabled;
+        newChatButton.disabled = requestInProgress;
+    }
+
+    function cancelMessageEdit(restoreFocus = true) {
+        if (!activeMessageEdit) return;
+        const { card, editor, editButton } = activeMessageEdit;
+        card.querySelector(".message").hidden = false;
+        card.querySelector(".user-message-actions").hidden = false;
+        card.classList.remove("is-editing");
+        editor.remove();
+        activeMessageEdit = null;
+        updateExportButton();
+        if (restoreFocus) editButton.focus({ preventScroll: true });
+    }
+
+    function renderUserMessageActions(element, index) {
+        const card = element.parentElement;
+        if (card.querySelector(".user-message-actions")) return;
+        const actions = document.createElement("div");
+        actions.className = "user-message-actions";
+        actions.setAttribute("role", "group");
+        actions.setAttribute("aria-label", "Actions de votre message");
+        const copy = document.createElement("button");
+        copy.type = "button";
+        copy.className = "toolbar-button copy-user-message";
+        copy.textContent = "Copier";
+        copy.setAttribute("aria-label", "Copier votre message");
+        copy.addEventListener("click", async () => {
+            try {
+                await navigator.clipboard.writeText(messageText.get(element) || element.textContent);
+                copy.textContent = "Copié";
+                window.setTimeout(() => { copy.textContent = "Copier"; }, 1600);
+            } catch {
+                showChatError("Impossible de copier le message. Vérifiez les permissions du presse-papiers.");
+            }
+        });
+        const edit = document.createElement("button");
+        edit.type = "button";
+        edit.className = "toolbar-button edit-user-message";
+        edit.textContent = "Modifier";
+        edit.setAttribute("aria-label", "Modifier votre message");
+        edit.disabled = requestInProgress;
+        edit.addEventListener("click", () => {
+            if (requestInProgress) return;
+            cancelMessageEdit(false);
+            const original = messageText.get(element) || element.textContent;
+            const editor = document.createElement("form");
+            editor.className = "user-message-editor";
+            editor.setAttribute("aria-label", "Modifier votre message");
+            const input = document.createElement("textarea");
+            input.className = "edit-message-input";
+            input.setAttribute("aria-label", "Message à modifier");
+            input.maxLength = 4000;
+            input.required = true;
+            input.rows = 3;
+            input.value = original;
+            const help = document.createElement("p");
+            help.className = "edit-message-help";
+            help.id = "edit-message-help";
+            help.textContent = "Une nouvelle réponse sera générée à partir de ce message. L’ancienne version restera dans l’historique.";
+            input.setAttribute("aria-describedby", help.id);
+            const controls = document.createElement("div");
+            controls.className = "edit-message-controls";
+            const cancel = document.createElement("button");
+            cancel.type = "button";
+            cancel.className = "toolbar-button cancel-message-edit";
+            cancel.textContent = "Annuler";
+            cancel.addEventListener("click", () => { if (!requestInProgress) cancelMessageEdit(); });
+            const save = document.createElement("button");
+            save.type = "submit";
+            save.className = "toolbar-button save-message-edit";
+            save.textContent = "Envoyer la modification";
+            const resize = () => {
+                input.style.height = "auto";
+                input.style.height = `${Math.min(input.scrollHeight, 240)}px`;
+                save.disabled = !input.value.trim() || input.value.length > 4000;
+            };
+            input.addEventListener("input", resize);
+            input.addEventListener("keydown", event => {
+                if (event.key === "Escape" && !requestInProgress) {
+                    event.preventDefault(); cancelMessageEdit();
+                } else if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+                    event.preventDefault(); if (!save.disabled) editor.requestSubmit();
+                }
+            });
+            controls.append(cancel, save);
+            editor.append(input, help, controls);
+            element.hidden = true;
+            actions.hidden = true;
+            card.classList.add("is-editing");
+            card.append(editor);
+            activeMessageEdit = { card, editor, input, save, cancel, editButton: edit, index, original, conversationId: activeConversationId };
+            editor.addEventListener("submit", submitMessageEdit);
+            followConversation = false;
+            updateExportButton();
+            resize();
+            input.focus({ preventScroll: true });
+            input.setSelectionRange(input.value.length, input.value.length);
+            editor.scrollIntoView({ block: "nearest" });
+        });
+        actions.append(copy, edit);
+        card.append(actions);
+    }
+
+    async function submitMessageEdit(event) {
+        event.preventDefault();
+        if (!activeMessageEdit || requestInProgress) return;
+        const edit = activeMessageEdit;
+        const content = edit.input.value.trim();
+        if (!content || content.length > 4000 || !edit.conversationId) return;
+        requestInProgress = true;
+        edit.input.disabled = edit.save.disabled = edit.cancel.disabled = true;
+        edit.save.textContent = "Préparation…";
+        clearChatError();
+        updateExportButton();
+        let branch;
+        try {
+            branch = await requestJson(`/api/conversations/${encodeURIComponent(edit.conversationId)}/edit`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message_index: edit.index, original_content: edit.original, content }),
+            });
+        } catch (error) {
+            requestInProgress = false;
+            edit.input.disabled = edit.save.disabled = edit.cancel.disabled = false;
+            edit.save.textContent = "Envoyer la modification";
+            showChatError(error.message || "La modification n’a pas pu être envoyée. Réessayez.");
+            updateExportButton();
+            return;
+        }
+        requestInProgress = false;
+        cancelMessageEdit(false);
+        activeConversationId = branch.id;
+        const prefix = branch.messages.slice(0, -1);
+        conversationHistory = prefix.map(message => message.content);
+        renderSavedMessages(prefix);
+        domainSelect.value = branch.domain;
+        customDomainInput.value = branch.custom_domain || "";
+        updateDomainHint();
+        updateExportButton();
+        const draft = promptInput.value;
+        promptInput.value = content;
+        syncPromptComposer();
+        form.requestSubmit();
+        promptInput.value = draft;
+        syncPromptComposer();
+    }
+
+    function renderSavedMessages(messages) {
+        gptOutput.replaceChildren();
+        messages.forEach((message, index) => {
+            const element = appendMessage(message.content, message.role);
+            if (message.role === "user") renderUserMessageActions(element, index);
+            else {
+                renderGenerationState(element, message.generation, index === messages.length - 1);
+                renderSourceReferences(element, message.source_references || [], message.id);
+                renderCopyAction(element);
+                renderResponseRating(element, message.id, message.rating);
+            }
+        });
+    }
+
     async function openConversation(conversationId) {
         if (requestInProgress) return;
 
@@ -1460,24 +1871,17 @@ document.addEventListener("DOMContentLoaded", () => {
             const conversation = await requestJson(
                 `/api/conversations/${encodeURIComponent(conversationId)}`
             );
+            cancelMessageEdit(false);
             activeConversationId = conversation.id;
             setActiveView("assistant");
             conversationHistory = conversation.messages.map(message => message.content);
             updateExportButton();
-            gptOutput.replaceChildren();
-            conversation.messages.forEach((message) => {
-                const messageElement = appendMessage(message.content, message.role);
-                if (message.role === "assistant") {
-                    renderSourceReferences(
-                        messageElement, message.source_references || [], message.id
-                    );
-                    renderCopyAction(messageElement);
-                    renderResponseRating(messageElement, message.id, message.rating);
-                }
-            });
+            renderSavedMessages(conversation.messages);
             domainSelect.value = conversation.domain;
             customDomainInput.value = conversation.custom_domain || "";
             updateDomainHint();
+            closeMobileSidebar();
+            syncConversationScroll(true);
             clearChatError();
             await refreshConversationList();
             await refreshPerformanceDashboard();
@@ -1516,7 +1920,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function syncPromptComposer() {
         promptInput.style.height = "auto";
-        promptInput.style.height = `${Math.min(promptInput.scrollHeight, 180)}px`;
+        const maxHeight = parseFloat(getComputedStyle(promptInput).maxHeight) || 160;
+        promptInput.style.height = `${Math.min(promptInput.scrollHeight, maxHeight)}px`;
         promptCounter.textContent = `${promptInput.value.length.toLocaleString("fr-FR")} / 4 000`;
         clearPromptButton.classList.toggle("hidden", !promptInput.value.length);
         clearPromptButton.classList.toggle("inline-flex", Boolean(promptInput.value.length));
@@ -1529,6 +1934,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     promptInput.addEventListener("input", syncPromptComposer);
+    window.addEventListener("resize", syncPromptComposer);
     promptInput.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
             event.preventDefault();
@@ -1555,6 +1961,20 @@ document.addEventListener("DOMContentLoaded", () => {
     customDomainInput.addEventListener("input", updateDomainHint);
     exportPdfButton.addEventListener("click", downloadConversationSummary);
     exportConversationButton.addEventListener("click", downloadFullConversation);
+    exportFormat.addEventListener("change", () => {
+        updateExportButton();
+        downloadFullConversation();
+    });
+    const exportMenu = document.querySelector("#conversation-actions");
+    document.addEventListener("click", (event) => {
+        if (!exportMenu.contains(event.target) && !event.target.closest("a[download]")) exportMenu.open = false;
+    });
+    exportMenu.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+            exportMenu.open = false;
+            exportMenu.querySelector("summary").focus();
+        }
+    });
     updateDomainHint();
     updateExportButton();
 
@@ -1593,7 +2013,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // Efface les messages et remet le formulaire à zéro.
     confirmNewChatButton.addEventListener("click", async () => {
         if (requestInProgress) return;
-
+        cancelMessageEdit(false);
         gptOutput.replaceChildren();
         activeConversationId = null;
         conversationHistory = [];
@@ -1633,6 +2053,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Affiche la question de l’utilisateur dans la conversation.
         const userMessageElement = appendMessage(prompt);
+        gptOutput.querySelectorAll('.continue-response').forEach(control => control.remove());
+        renderUserMessageActions(userMessageElement, conversationHistory.length);
         conversationHistory.push(prompt);
         clearChatError();
 
@@ -1641,6 +2063,8 @@ document.addEventListener("DOMContentLoaded", () => {
         domainSelect.value = selectedDomain;
         customDomainInput.value = customDomain;
         updateDomainHint();
+        syncPromptComposer();
+        syncConversationScroll(true);
 
         // Désactive le bouton pour éviter plusieurs envois simultanés.
         button.disabled = true;
@@ -1656,6 +2080,7 @@ document.addEventListener("DOMContentLoaded", () => {
         });
 
         let streamStarted = false;
+        let output = null;
         try {
             if (!activeConversationId) {
                 const conversation = await requestJson("/api/conversations", {
@@ -1681,13 +2106,18 @@ document.addEventListener("DOMContentLoaded", () => {
             streamStarted = true;
 
             // Crée un bloc vide destiné à recevoir la réponse de l’IA.
-            const output = appendMessage("", "assistant");
+            output = appendMessage("", "assistant");
 
             // Lit et affiche progressivement les fragments de la réponse.
             const assistantMessage = await readResponseChunks(reader, output);
             if (assistantMessage) {
                 lastFailedRequest = null;
                 conversationHistory.push(assistantMessage);
+                renderGenerationState(output, messageGeneration.get(output));
+                renderCopyAction(output);
+                if (messageGeneration.get(output)?.status !== 'complete') {
+                    showChatError(`${messageGeneration.get(output)?.message || 'Réponse incomplète.'} Le texte reçu reste visible.`);
+                }
                 try {
                     const savedConversation = await requestJson(
                         `/api/conversations/${encodeURIComponent(activeConversationId)}`
@@ -1696,6 +2126,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         .reverse()
                         .find((message) => message.role === "assistant");
                     if (savedResponse) {
+                        renderGenerationState(output, savedResponse.generation);
                         renderSourceReferences(
                             output, savedResponse.source_references || [], savedResponse.id
                         );
@@ -1710,12 +2141,22 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (error) {
             console.error(error);
             if (streamStarted) {
-                activeConversationId = null;
-                conversationHistory = [];
-                gptOutput.replaceChildren();
+                if (output) {
+                    renderGenerationState(output, messageGeneration.get(output));
+                    renderCopyAction(output);
+                }
+                // Keep the text already received visible, including older messages.
+                // Reconcile with SQLite before a retry so the saved turn order is used.
+                try {
+                    const saved = await requestJson(`/api/conversations/${encodeURIComponent(activeConversationId)}`);
+                    conversationHistory = saved.messages.map((message) => message.content);
+                } catch {
+                    const partial = gptOutput.lastElementChild?.querySelector(".message");
+                    if (partial && messageText.get(partial)) conversationHistory.push(messageText.get(partial));
+                }
                 showChatError(
                     "La connexion a été interrompue pendant la réponse. " +
-                    "La conversation enregistrée reste disponible dans votre historique."
+                    "Le texte reçu reste visible. Vous pouvez réessayer ou rouvrir la conversation depuis l’historique."
                 );
             } else {
                 userMessageElement.parentElement.remove();

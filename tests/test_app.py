@@ -216,6 +216,80 @@ class FlaskGPTTestCase(unittest.TestCase):
         self.assertEqual(metrics["total_tokens"], 15)
         self.assertEqual(metrics["prompt_token_reports"], 1)
 
+    def test_gfm_formatting_rules_reach_groq_without_replacing_domain_instructions(self):
+        captured = []
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.append(kwargs["messages"])
+                return iter([SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content="Réponse valide."))], usage=None,
+                )])
+
+        flaskgpt.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+        for domain in flaskgpt.DOMAIN_INSTRUCTIONS:
+            with self.subTest(domain=domain):
+                custom = "Éducation" if domain == "Autre" else ""
+                conversation = self.create_conversation(domain, custom)
+                response = self.client.post("/prompt", json={
+                    "conversation_id": conversation["id"], "domain": domain,
+                    "custom_domain": custom, "messages": ["Explique avec des exemples Python."],
+                })
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_data(as_text=True), "Réponse valide.")
+                system = captured[-1][0]
+                self.assertEqual(system["role"], "system")
+                self.assertIn(flaskgpt.MARKDOWN_INSTRUCTIONS, system["content"])
+                self.assertIn(custom or flaskgpt.DOMAIN_INSTRUCTIONS[domain], system["content"])
+                self.assertEqual(captured[-1][-1]["content"], "Explique avec des exemples Python.")
+
+    def test_edit_user_message_preserves_original_and_forks_only_prior_context(self):
+        conversation = self.create_conversation("Autre", "Éducation")
+        original_text = ["Question initiale", "Réponse initiale", "Deuxième question", "Ancienne réponse", "Suite", "Fin"]
+        flaskgpt.save_conversation_history(conversation["id"], original_text, "Autre", "Éducation")
+        original = self.client.get(f"/api/conversations/{conversation['id']}").get_json()
+        answer_id = original["messages"][1]["id"]
+        self.client.post(f"/api/messages/{answer_id}/rating", json={"rating": "satisfaisante"})
+        with flaskgpt.database_connection() as connection:
+            connection.execute("UPDATE messages SET source_references = ? WHERE id = ?", ('[{"code":"R1","excerpt":"Extrait"}]', answer_id))
+        original = self.client.get(f"/api/conversations/{conversation['id']}").get_json()
+        response = self.client.post(f"/api/conversations/{conversation['id']}/edit", json={
+            "message_index": 2, "original_content": "Deuxième question", "content": "Question corrigée",
+        })
+        self.assertEqual(response.status_code, 201)
+        branch = response.get_json()
+        self.assertNotEqual(branch["id"], original["id"])
+        self.assertEqual(branch["domain"], "Autre")
+        self.assertEqual(branch["custom_domain"], "Éducation")
+        self.assertEqual([m["content"] for m in branch["messages"]], original_text[:2] + ["Question corrigée"])
+        self.assertEqual(branch["messages"][1]["rating"], "satisfaisante")
+        self.assertEqual(branch["messages"][1]["source_references"], original["messages"][1]["source_references"])
+        self.assertNotEqual(branch["messages"][1]["id"], answer_id)
+        self.assertEqual(self.client.get(f"/api/conversations/{conversation['id']}").get_json(), original)
+        # Continuing the new branch must not duplicate the edited turn or erase its prefix.
+        flaskgpt.save_conversation_history(branch["id"], [m["content"] for m in branch["messages"]], "Autre", "Éducation")
+        self.assertEqual(self.client.get(f"/api/conversations/{branch['id']}").get_json()["messages"], branch["messages"])
+
+    def test_edit_message_rejects_invalid_stale_and_assistant_turns(self):
+        conversation = self.create_conversation()
+        flaskgpt.save_conversation_history(conversation["id"], ["Question", "Réponse"], "Général")
+        url = f"/api/conversations/{conversation['id']}/edit"
+        for index, content, original, status in [
+            (-1, "Texte", "Question", 400), (True, "Texte", "Question", 400),
+            (99, "Texte", "Question", 400), (1, "Texte", "Réponse", 400),
+            (0, " ", "Question", 400), (0, "x" * 4001, "Question", 400),
+            (0, None, "Question", 400), (0, "Texte", "Ancien texte", 409),
+        ]:
+            with self.subTest(index=index, status=status):
+                response = self.client.post(url, json={"message_index": index, "content": content, "original_content": original})
+                self.assertEqual(response.status_code, status)
+        self.assertEqual(len(self.client.get('/api/conversations').get_json()), 1)
+        self.assertEqual(self.client.post(url, data="plain").status_code, 415)
+        self.assertEqual(self.client.post('/api/conversations/missing/edit', json={"message_index": 0, "content": "Texte"}).status_code, 404)
+        first = self.client.post(url, json={"message_index": 0, "content": "Première question corrigée", "original_content": "Question"})
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual([m["content"] for m in first.get_json()["messages"]], ["Première question corrigée"])
+
     def test_empty_dashboard_returns_zero_counts_and_unavailable_averages(self):
         conversations = self.client.get("/api/conversations").get_json()
         performance = self.client.get("/api/performance").get_json()
@@ -660,7 +734,10 @@ class FlaskGPTTestCase(unittest.TestCase):
             "conversation_id": conversation["id"], "messages": ["Question"], "domain": "Finance",
         })
         self.assertEqual(response.status_code, 200)
-        self.assertIn("trop de temps", response.get_data(as_text=True))
+        self.assertEqual("Partie recue", response.get_data(as_text=True))
+        saved = self.client.get(f"/api/conversations/{conversation['id']}").get_json()["messages"][-1]
+        self.assertEqual(saved["content"], "Partie recue")
+        self.assertEqual(saved["generation"]["reason"], "interrupted")
         recent = self.client.get("/api/performance").get_json()["recent_requests"][0]
         self.assertEqual(recent["status"], "partial")
         self.assertEqual(recent["error_type"], "APITimeoutError")
